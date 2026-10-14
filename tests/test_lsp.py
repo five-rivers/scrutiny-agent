@@ -1,18 +1,36 @@
 """`lsp.*` request-level queries.
 
-Two layers are tested. Parameter validation and the clean-failure path
-run everywhere: a missing language server must produce `LSP_FAILED`,
-never a hang or a crash. The semantic assertions (a definition really
-points at the definition) run only where a real server is installed,
-and skip cleanly otherwise.
+Two layers are tested. Parameter validation and the no-server path
+run everywhere: with no language server installed, the location
+queries (`gotoDefinition`, `findReferences`) answer from a text search
+and say so with `source: "text"`, and everything else fails fast with
+`LSP_FAILED`; never a hang or a crash. The semantic assertions (a
+definition really points at the definition) run only where a real
+server is installed, and skip cleanly otherwise.
 """
 import pytest
 
 from scrutiny import AgentError, INVALID_REQUEST, LSP_FAILED
 
 SWIFT = 8          # rarely installed on Linux -- the "no server" probe
-POSITIONAL = ["lsp.gotoDefinition", "lsp.findReferences", "lsp.hover"]
+LOCATIONS = ["lsp.gotoDefinition", "lsp.findReferences"]
+POSITIONAL = LOCATIONS + ["lsp.hover"]
 WHOLE_FILE = ["lsp.documentSymbols", "lsp.foldingRange"]
+EXTENSIONS = {1: "rs", 2: "py", 3: "js", 4: "ts", 5: "go", 6: "cpp",
+              7: "c", 8: "swift"}
+
+
+@pytest.fixture
+def absent_language(available_languages):
+    """A language whose server is not installed on this host.
+
+    Swift first, so Linux CI probes the same path it always has; macOS
+    ships sourcekit-lsp, so there the probe is usually Go."""
+    for lang in (SWIFT, 5, 1, 3, 4, 6, 7, 2):
+        if lang not in available_languages:
+            return lang
+    pytest.skip("every language server is installed; "
+                "cannot test the absent path")
 
 
 def base_params(workspace, language, file_path, content):
@@ -55,26 +73,44 @@ def test_unknown_language_fails_cleanly(agent, workspace):
     assert error.code in (LSP_FAILED, INVALID_REQUEST)
 
 
-@pytest.mark.parametrize("method", POSITIONAL + WHOLE_FILE)
+@pytest.mark.parametrize("method", LOCATIONS)
+def test_missing_server_answers_from_text_search(agent, method, workspace,
+                                                 absent_language):
+    """A location query is never an error just because the server is
+    missing: it answers from a text search and says so."""
+    content = "x = x\n"
+    path = workspace.write("t." + EXTENSIONS[absent_language], content)
+    params = base_params(workspace.path, absent_language, path, content)
+    params.update({"line": 0, "character": 0})
+    result = agent.call(method, params, timeout=60)
+    assert result["source"] == "text"
+    assert "no language server" in result["note"]
+    assert isinstance(result["locations"], list)
+    for loc in result["locations"]:
+        assert loc["uri"].startswith("file://")
+    if method == "lsp.findReferences":
+        # Whole-word occurrences of `x`: both of them.
+        assert len(result["locations"]) == 2
+
+
+@pytest.mark.parametrize("method", ["lsp.hover"] + WHOLE_FILE)
 def test_missing_server_is_lsp_failed_not_a_hang(agent, method, workspace,
-                                                 available_languages):
+                                                 absent_language):
     """With no server for the language, the call fails fast and cleanly."""
-    if SWIFT in available_languages:
-        pytest.skip("sourcekit-lsp is installed; cannot test the absent path")
-    path = workspace.write("t.swift", "let x = 1\n")
-    params = base_params(workspace.path, SWIFT, path, "let x = 1\n")
-    params.update({"line": 0, "character": 4})
+    content = "x = x\n"
+    path = workspace.write("t." + EXTENSIONS[absent_language], content)
+    params = base_params(workspace.path, absent_language, path, content)
+    params.update({"line": 0, "character": 0})
     error = agent.call_expect_error(method, params, timeout=60)
     assert error.code == LSP_FAILED
 
 
 def test_agent_survives_repeated_lsp_failures(agent, workspace,
-                                              available_languages):
-    if SWIFT in available_languages:
-        pytest.skip("sourcekit-lsp is installed")
-    path = workspace.write("t.swift", "let x = 1\n")
-    params = base_params(workspace.path, SWIFT, path, "let x = 1\n")
-    params.update({"line": 0, "character": 4})
+                                              absent_language):
+    content = "x = x\n"
+    path = workspace.write("t." + EXTENSIONS[absent_language], content)
+    params = base_params(workspace.path, absent_language, path, content)
+    params.update({"line": 0, "character": 0})
     for _ in range(6):
         agent.call_expect_error("lsp.hover", params, timeout=60)
     assert agent.alive()
