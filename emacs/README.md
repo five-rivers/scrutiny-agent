@@ -187,6 +187,12 @@ How it gets there:
   round trip, not N. Opening a file sends the read, the listing of
   its directory, and the listings of the directories above it
   together.
+  The agent runs the requests it receives in parallel on a pool of
+  worker threads and answers each as it finishes, so replies arrive
+  in completion order and are matched to their request by id. N
+  independent questions therefore cost one round trip and about the
+  time of the slowest, not the sum. In Lisp, `scrutiny-agent-send`
+  returns a future and `scrutiny-agent-await` waits for one.
 - **A listing is a proof.** One attributed `fs.listDirectory` answers
   every later question about names in that directory — including "it
   does not exist", which is most of what Emacs asks (`.dir-locals.el`,
@@ -255,9 +261,10 @@ remote directory, and a magit upgrade has nothing to break.
 - **A refresh is one round trip, not fifty.** magit asks its
   questions one at a time and waits for each answer. The read-only
   ones are almost always the same ones as last time, so when a
-  command starts, the batch it ran before is sent again at once, and
-  magit's own sequential calls are then answered from replies already
-  on their way. Nothing is ever *shown* from the previous run — only
+  command starts, the batch it ran before is sent again at once; the
+  agent runs those git processes in parallel, and magit's own
+  sequential calls are then answered from replies already on their
+  way. Nothing is ever *shown* from the previous run — only
   the questions are predicted, never the answers — and a mutating
   command is never speculated. The first refresh of a repository in a
   brand-new Emacs has nothing to go on; the batch is remembered in

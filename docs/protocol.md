@@ -126,6 +126,45 @@ indistinguishable from the transport closing. Only EOF ends a
 session. A bare `\r\n\r\n` between frames is padding and is
 ignored silently.
 
+### Concurrency and ordering
+
+The connection is a pipeline, not a call-and-response channel. Stated
+explicitly, because a client that assumes otherwise will work and be
+slow:
+
+- **Send without waiting.** A client may send any number of requests
+  before reading a reply. Each carries its own `id`, the agent echoes
+  it, and the `id` is the only thing that ties a reply to its request.
+- **The agent runs them at the same time.** One reader thread parses
+  frames and queues each request; a pool of 16 worker threads takes
+  requests from the queue and runs them independently. A request does
+  not wait for the one sent before it.
+- **Replies come back in completion order, not request order.** A
+  fast `fs.stat` sent after a slow `git.exec` is answered first. A
+  client must match replies by `id` and must not assume the next frame
+  answers its latest request. `rpc.chunk` notifications of different
+  requests interleave the same way.
+- **The only serialization is the per-lane cap.** Normal runs at most
+  8 requests at once and bulk 2 (*Priority lanes*, below); a request
+  past the cap waits in its lane's FIFO queue until a slot frees.
+  Interactive is bounded only by the pool. Workers always take a
+  runnable request from the highest lane that has one, so queued
+  normal work waits behind interactive work, and bulk behind both.
+- **So N independent questions cost one round trip and about the time
+  of the slowest, not the sum.** There is no batch method and none is
+  needed: a burst of N frames is the batch, and each answer is usable
+  as soon as it arrives rather than when the whole burst is done. The
+  Emacs client works this way throughout (`scrutiny-agent-send`
+  returns a future, `scrutiny-agent-await` blocks on one); a magit
+  refresh is a burst of about forty `git.exec` requests, answered in
+  one round trip with 8 git processes running at a time.
+- **What runs in parallel is independent.** Each `git.exec` forks its
+  own git process with its own working directory and environment; two
+  on the same repository are as independent as two git invocations in
+  two terminals. Read-only commands cannot interfere with each other.
+  Mutating commands contend on git's own locks (`index.lock`) exactly
+  as they would at a shell; the agent does not serialize them for you.
+
 ### Streaming large bodies (`rpc.chunk`)
 
 A response whose body would exceed the frame cap is split into
@@ -156,8 +195,14 @@ Three lanes — `interactive`, `normal`, `bulk` — govern both worker
 scheduling (per-lane slot caps: normal 8, bulk 2, pool 16) and writer
 scheduling (higher lanes preempt at frame boundaries). Per-method
 defaults: `index.run`, `git.clone`, `git.fetch`,
-`git.ensureRepository` are bulk; `meta.debug` and `cred.selftest`
-are normal; everything else is interactive.
+`git.ensureRepository` are bulk; `meta.debug`, `cred.selftest`,
+`git.exec` and `lsp.tunnelOpen` are normal; everything else is
+interactive. `git.exec` is normal because it covers both the quick
+reads of a magit refresh and network work such as `fetch`, and
+`lsp.tunnelOpen` because it spawns a server. A client that wants a
+burst of read-only `git.exec` calls to run more than 8 at a time
+sends them with `"lane": "interactive"`; interactive has no cap
+below the pool size.
 
 ## Handshake
 
@@ -341,7 +386,9 @@ is capped at 16 MiB per stream, with `truncated: true` when the cap
 bites. Subcommands that can reach the network (`fetch`, `pull`,
 `push`, `ls-remote`, `clone`, `submodule`) go through the credential
 broker when `authOpId` is given. Runs on the `normal` lane by default;
-override with the top-level `lane` field.
+override with the top-level `lane` field. Any number of `git.exec`
+requests may be in flight at once, each in its own git process; see
+*Concurrency and ordering*.
 
 `repoPath` is authorized against the fs roots like any other path.
 The child's stdin is `/dev/null`, or exactly the bytes of

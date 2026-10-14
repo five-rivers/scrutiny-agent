@@ -234,9 +234,11 @@ Lane laneFromString(const std::string& s, Lane fallback) {
     return fallback;
 }
 
-// Per-method default lane. Every method the agent serves today is a
-// small interactive read; meta.debug defaults to normal so the test
-// harness can explicitly tag lanes.
+// Per-method default lane. Most methods are small interactive reads;
+// the long-running or network ones are bulk, and the ones that can be
+// either (git.exec, lsp.tunnelOpen) are normal. meta.debug defaults to
+// normal so the test harness can explicitly tag lanes. The top-level
+// "lane" field of a request overrides this.
 Lane defaultLaneFor(const std::string& method) {
     if (method == "meta.debug") return Lane::Normal;
     if (method == "index.run" || method == "git.clone" ||
