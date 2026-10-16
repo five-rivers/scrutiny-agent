@@ -660,8 +660,127 @@ with it."
     (insert-file-contents-literally file)
     (secure-hash 'sha256 (current-buffer))))
 
-(defun scrutiny-agent--local-binary (host-plist arch)
-  "Path to the agent binary to stream to a host of architecture ARCH.
+(defun scrutiny-agent--image-header (file)
+  "The first 64 bytes of FILE as a unibyte string; nil when it is empty."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally file nil 0 64)
+    (and (> (buffer-size) 0) (buffer-string))))
+
+(defun scrutiny-agent--machine-name (code)
+  "The architecture we name binaries by for an ELF or Mach-O CPU CODE."
+  (pcase code
+    ((or 62 #x01000007) "x86_64")
+    ((or 183 #x0100000c) "aarch64")
+    (_ (format "machine type %#x" code))))
+
+(defun scrutiny-agent--binary-problem (file &optional uname-s arch)
+  "Why FILE cannot be the agent for a UNAME-S / ARCH host, or nil.
+
+Reads the first 64 bytes and nothing more: enough to tell an ELF or
+Mach-O image from anything else, and to read the machine type out of
+it.  UNAME-S and ARCH, when given, are what the remote reported;
+whether the image actually runs there is for the verify step, which
+execs it.
+
+This exists because the alternative was observed: a release that had
+not been published, so GitHub answered 404; `url-copy-file' saving
+its nine-byte \"Not Found\" page as the binary; every later connect
+streaming that to the host, installing it over a working agent, and
+only then failing with `the binary does not run'.  A file that is
+not an executable image never leaves this machine."
+  (let* ((head (scrutiny-agent--image-header file))
+         (want (and arch (scrutiny-agent--normalize-machine arch)))
+         (len (length head)))
+    (cl-flet ((u16 (i big) (if big
+                               (logior (ash (aref head i) 8) (aref head (1+ i)))
+                             (logior (aref head i) (ash (aref head (1+ i)) 8))))
+              (u32le (i) (logior (aref head i) (ash (aref head (+ i 1)) 8)
+                                 (ash (aref head (+ i 2)) 16)
+                                 (ash (aref head (+ i 3)) 24)))
+              (wrong-machine (got)
+                (and want (not (string= got want))
+                     (format "%s is a %s binary, not %s" file got want))))
+      (cond
+       ((null head) (format "%s is empty" file))
+       ((< len 64)
+        ;; Nothing executable is this short; it is text of some kind.
+        (let ((text (replace-regexp-in-string "[^[:print:]]+" " " head)))
+          (format "%s is %d bytes, not an executable image: %S%s" file len text
+                  (if (string-prefix-p "Not Found" head)
+                      " -- GitHub's answer for a release asset that does not \
+exist, saved by an earlier download"
+                    ""))))
+       ((string-prefix-p "\177ELF" head)
+        (or (and (equal uname-s "Darwin")
+                 (format "%s is a Linux (ELF) binary; the host is Darwin" file))
+            (wrong-machine (scrutiny-agent--machine-name
+                            (u16 18 (= (aref head 5) 2))))))
+       ((member (substring head 0 4) '("\317\372\355\376" "\316\372\355\376"))
+        (or (and (equal uname-s "Linux")
+                 (format "%s is a macOS (Mach-O) binary; the host is Linux" file))
+            (wrong-machine (scrutiny-agent--machine-name (u32le 4)))))
+       ((member (substring head 0 4) '("\312\376\272\276" "\276\272\376\312"))
+        ;; A universal (fat) Mach-O: let the host pick its slice.
+        (and (equal uname-s "Linux")
+             (format "%s is a macOS (fat Mach-O) binary; the host is Linux" file)))
+       (t
+        (format "%s is not an ELF or Mach-O executable (starts %S)" file
+                (replace-regexp-in-string "[^[:print:]]+" " "
+                                          (substring head 0 16))))))))
+
+(defvar url-http-response-status)
+
+(defun scrutiny-agent--http-get (url)
+  "The body of URL as a unibyte string.  Signals on anything but 200.
+`url-copy-file' is not used because it saves whatever came back: for
+an asset that does not exist, that is GitHub's 404 page."
+  (let ((buf (url-retrieve-synchronously url t t 120)))
+    (unless (buffer-live-p buf)
+      (error "No response from %s" url))
+    (unwind-protect
+        (with-current-buffer buf
+          (let ((status (and (boundp 'url-http-response-status)
+                             url-http-response-status)))
+            (unless (eql status 200)
+              (error "HTTP %s from %s" (or status "(no status)") url))
+            (goto-char (point-min))
+            (unless (re-search-forward "\r?\n\r?\n" nil t)
+              (error "Malformed HTTP response from %s" url))
+            (let ((body (buffer-substring-no-properties (point) (point-max))))
+              (if (multibyte-string-p body)
+                  (encode-coding-string body 'raw-text)
+                body))))
+      (kill-buffer buf))))
+
+(defun scrutiny-agent--download-release (arch dest)
+  "Fetch the published agent for ARCH into DEST; return DEST.
+The release carries a `.sha256' sidecar beside each binary (written by
+docker/build-agent.sh); the body is hashed against it before anything
+is written, so the cache never holds a download that did not match."
+  (let* ((ver scrutiny-agent-binary-version)
+         (url (format scrutiny-agent-release-url-format ver ver arch)))
+    (make-directory (file-name-directory dest) t)
+    (message "scrutiny-agent: downloading %s..." url)
+    (condition-case err
+        (let* ((expected (car (split-string
+                               (scrutiny-agent--http-get (concat url ".sha256")))))
+               (body (scrutiny-agent--http-get url))
+               (got (secure-hash 'sha256 body)))
+          (unless (and expected (string= got expected))
+            (error "Downloaded sha256 %s does not match the published %s" got expected))
+          (let ((coding-system-for-write 'binary))
+            (with-temp-file dest (set-buffer-multibyte nil) (insert body))
+            (with-temp-file (concat dest ".sha256") (insert expected "\n")))
+          (set-file-modes dest #o755)
+          dest)
+      (error
+       (error "Scrutiny-agent: no binary for %s.  Build one with \
+scripts/build-agents.sh, or set :local-binary.  (Download failed: %s)"
+              arch (error-message-string err))))))
+
+(defun scrutiny-agent--local-binary (host-plist arch &optional uname-s)
+  "Path to the agent binary to stream to HOST-PLIST's host, of architecture ARCH.
 
 Looked for in this order, so a locally built binary always wins over
 the network:
@@ -675,47 +794,63 @@ the network:
   3. `scrutiny-agent-cache-directory', by the release file name.
      `scripts/build-agents.sh' installs both architectures there.
   4. The published release for ARCH, downloaded once and cached
-     alongside (3).
+     alongside (3), checked against its `.sha256' sidecar.
+
+Whatever is found is checked with `scrutiny-agent--binary-problem'
+against ARCH and UNAME-S (the remote's `uname -s', when known) before
+it is returned, so a file that is not an agent for that host is an
+error naming the file and the reason, not a transfer.  A cached file
+that is not an executable image at all is discarded first: the cache
+is this client's to manage, and an older client left GitHub's 404
+page there.
 
 Errors with something actionable when none of them produce a file --
 this is the step that fails first on a new machine."
   (let* ((local (plist-get host-plist :local-binary))
          (explicit (cond ((stringp local) local)
                          ((consp local) (cdr (assoc arch local))))))
-    (cond
-     (explicit
-      (let ((path (expand-file-name explicit)))
-        (unless (file-exists-p path)
-          (error "Scrutiny-agent: :local-binary %s does not exist" path))
-        path))
-     (t
-      (let* ((ver scrutiny-agent-binary-version)
-             (name (format "scrutiny-agent-%s-%s" ver arch))
-             (bundled (and scrutiny-agent-bundled-binary-directory
-                           (expand-file-name
-                            name scrutiny-agent-bundled-binary-directory)))
-             (cached (expand-file-name name
-                                       scrutiny-agent-cache-directory)))
-        (cond
-         ((and bundled (file-exists-p bundled)) bundled)
-         ((file-exists-p cached) cached)
-         (scrutiny-agent-download-releases
-          (let ((url (format scrutiny-agent-release-url-format
-                             ver ver arch)))
-            (make-directory scrutiny-agent-cache-directory t)
-            (message "scrutiny-agent: downloading %s..." url)
-            (condition-case err
-                (url-copy-file url cached)
-              (error
-               (error "Scrutiny-agent: no binary for %s.  Build one with \
-scripts/build-agents.sh, or set :local-binary.  (Download of %s failed: %s)"
-                      arch url (error-message-string err))))
-            cached))
-         (t
-          (error "Scrutiny-agent: no local binary for %s.  Expected %s; \
-build it with scripts/build-agents.sh --arch %s"
-                 arch cached
-                 (if (equal arch "aarch64") "arm64" "amd64")))))))))
+    (cl-flet ((checked (path)
+                (let ((problem (scrutiny-agent--binary-problem
+                                path uname-s arch)))
+                  (when problem
+                    (error "Scrutiny-agent: %s.  Build one with \
+scripts/build-agents.sh, or point :local-binary at a built agent"
+                           problem))
+                  path)))
+      (cond
+       (explicit
+        (let ((path (expand-file-name explicit)))
+          (unless (file-exists-p path)
+            (error "Scrutiny-agent: :local-binary %s does not exist" path))
+          (checked path)))
+       (t
+        (let* ((ver scrutiny-agent-binary-version)
+               (name (format "scrutiny-agent-%s-%s" ver arch))
+               (bundled (and scrutiny-agent-bundled-binary-directory
+                             (expand-file-name
+                              name scrutiny-agent-bundled-binary-directory)))
+               (cached (expand-file-name name
+                                         scrutiny-agent-cache-directory))
+               (discarded
+                (and (file-exists-p cached)
+                     (let ((problem (scrutiny-agent--binary-problem cached)))
+                       (when problem
+                         (message "scrutiny-agent: discarding %s" problem)
+                         (delete-file cached)
+                         (ignore-errors (delete-file (concat cached ".sha256")))
+                         problem)))))
+          (cond
+           ((and bundled (file-exists-p bundled)) (checked bundled))
+           ((file-exists-p cached) (checked cached))
+           (scrutiny-agent-download-releases
+            (checked (scrutiny-agent--download-release arch cached)))
+           (t
+            (error "Scrutiny-agent: no local binary for %s.  Expected %s; \
+build it with scripts/build-agents.sh --arch %s%s"
+                   arch cached
+                   (if (equal arch "aarch64") "arm64" "amd64")
+                   (if discarded (format ".  (Discarded: %s)" discarded)
+                     ""))))))))))
 
 (defun scrutiny-agent-installed-binaries ()
   "Alist of (ARCH . PATH) for locally available agent binaries.
@@ -731,7 +866,11 @@ directories win, matching the lookup order in
         (dolist (file (directory-files dir))
           (when (and (string-prefix-p prefix file)
                      (not (string-suffix-p ".sha256" file))
-                     (not (assoc (substring file (length prefix)) found)))
+                     (not (assoc (substring file (length prefix)) found))
+                     ;; Only files that could be streamed: a 404 page
+                     ;; saved under a binary's name is not an install.
+                     (not (scrutiny-agent--binary-problem
+                           (expand-file-name file dir))))
             (push (cons (substring file (length prefix))
                         (expand-file-name file dir))
                   found)))))
@@ -880,7 +1019,7 @@ remote shell has exec'd the agent (the pipe then speaks JSON-RPC)."
 Supported: Linux on x86_64 or aarch64.  Build one and point :local-binary \
 at it if this platform is expected to work"
                             name uname-s uname-m)))
-           (binary (scrutiny-agent--local-binary host-plist arch))
+           (binary (scrutiny-agent--local-binary host-plist arch uname-s))
            (hash (scrutiny-agent--file-sha256 binary))
            (bname (format "scrutiny-agent-%s-%s"
                           scrutiny-agent-binary-version arch)))

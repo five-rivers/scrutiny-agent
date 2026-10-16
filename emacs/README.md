@@ -130,9 +130,18 @@ server needs a *Linux* binary locally. Two ways:
 
 - **Cut a release**. `git tag v0.2.0 && git push origin v0.2.0` builds
   and publishes both; the client downloads the right one on first
-  connect and caches it in the same directory.
+  connect, checks it against the published `.sha256` sidecar, and
+  caches it in the same directory.
   `scrutiny-agent-binary-version` selects which release to fetch, and
   `scrutiny-agent-download-releases` set to nil keeps connects offline.
+  A release that has not been published is an error at connect
+  (`HTTP 404`), not a download.
+
+Whichever way the binary arrives, the client reads its header before
+streaming it: it must be an ELF (Linux) or Mach-O (macOS) image for
+the architecture the host reported. Anything else -- an empty file, a
+saved error page, a build for the other architecture -- is refused on
+this side with the file named, and nothing is sent or installed.
 
 - **Point at specific files**: `:local-binary "/path/to/agent"` for one
   host, or an alist to pick by architecture:

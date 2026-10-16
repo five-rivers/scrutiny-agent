@@ -20,6 +20,35 @@
 (require 'scrutiny-agent)
 (require 'scrutiny-agent-eglot)
 
+(defun scrutiny-agent-tests--image (os arch)
+  "A fake OS / ARCH executable header, padded past 64 bytes.
+Enough for `scrutiny-agent--binary-problem' to accept it as an agent
+for that platform; it does not run."
+  (let ((pad (make-list 100 0)))
+    (pcase os
+      ('linux (apply #'unibyte-string
+                     #x7f ?E ?L ?F 2 1 1 0 0 0 0 0 0 0 0 0 2 0
+                     (if (equal arch "aarch64") #xb7 #x3e) 0 pad))
+      ('darwin (apply #'unibyte-string
+                      #xcf #xfa #xed #xfe
+                      (if (equal arch "aarch64") #x0c 7) 0 0 1 pad)))))
+
+(defun scrutiny-agent-tests--write-image (path os arch)
+  "Write a fake OS / ARCH executable to PATH and return PATH."
+  (let ((coding-system-for-write 'binary))
+    (with-temp-file path
+      (set-buffer-multibyte nil)
+      (insert (scrutiny-agent-tests--image os arch))))
+  (set-file-modes path #o755)
+  path)
+
+(defun scrutiny-agent-tests--host-image ()
+  "The fake image that passes the local check for a `sh' transport here."
+  (scrutiny-agent-tests--image
+   (if (eq system-type 'darwin) 'darwin 'linux)
+   (if (string-match-p "aarch64\\|arm64" system-configuration)
+       "aarch64" "x86_64")))
+
 ;; ---------------------------------------------------------------------
 ;; Framing
 ;; ---------------------------------------------------------------------
@@ -240,6 +269,7 @@
 (ert-deftest scrutiny-agent-local-binary-string-form ()
   ;; A plain string means "this binary, this host" -- unchanged behavior.
   (let ((f (make-temp-file "scra-bin")))
+    (scrutiny-agent-tests--write-image f 'linux "x86_64")
     (unwind-protect
         (should (equal (scrutiny-agent--local-binary (list :local-binary f)
                                                      "x86_64")
@@ -250,6 +280,8 @@
   ;; One Emacs driving both an x86 server and an ARM one.
   (let ((amd (make-temp-file "scra-amd"))
         (arm (make-temp-file "scra-arm")))
+    (scrutiny-agent-tests--write-image amd 'linux "x86_64")
+    (scrutiny-agent-tests--write-image arm 'linux "aarch64")
     (unwind-protect
         (let ((plist (list :local-binary (list (cons "x86_64" amd)
                                                (cons "aarch64" arm)))))
@@ -270,7 +302,7 @@
          (path (expand-file-name name dir)))
     (unwind-protect
         (progn
-          (with-temp-file path (insert "binary"))
+          (scrutiny-agent-tests--write-image path 'linux "aarch64")
           (should (equal (scrutiny-agent--local-binary nil "aarch64") path)))
       (delete-directory dir t))))
 
@@ -298,7 +330,9 @@
                           "scrutiny-agent-1.2.3-aarch64"
                           "scrutiny-agent-1.2.3-x86_64.sha256"
                           "scrutiny-agent-0.0.1-x86_64"))
-            (with-temp-file (expand-file-name name dir) (insert "x")))
+            (scrutiny-agent-tests--write-image
+             (expand-file-name name dir) 'linux
+             (if (string-suffix-p "aarch64" name) "aarch64" "x86_64")))
           (let ((found (scrutiny-agent-installed-binaries)))
             (should (equal (sort (mapcar #'car found) #'string<)
                            '("aarch64" "x86_64")))))
@@ -307,6 +341,176 @@
 (ert-deftest scrutiny-agent-explicit-binary-must-exist ()
   (should-error (scrutiny-agent--local-binary
                  (list :local-binary "/no/such/agent") "x86_64")))
+
+;; ---------------------------------------------------------------------
+;; What may be streamed: the local check on the binary
+;; ---------------------------------------------------------------------
+
+(ert-deftest scrutiny-agent-binary-problem-reads-the-image-header ()
+  (let ((file (make-temp-file "scra-img")))
+    (unwind-protect
+        (progn
+          (scrutiny-agent-tests--write-image file 'linux "x86_64")
+          (should-not (scrutiny-agent--binary-problem file))
+          (should-not (scrutiny-agent--binary-problem file "Linux" "x86_64"))
+          (should-not (scrutiny-agent--binary-problem file "Linux" "amd64"))
+          (should (string-match-p "x86_64 binary, not aarch64"
+                                  (scrutiny-agent--binary-problem
+                                   file "Linux" "aarch64")))
+          (should (string-match-p "Linux (ELF) binary; the host is Darwin"
+                                  (scrutiny-agent--binary-problem
+                                   file "Darwin" "x86_64")))
+          (scrutiny-agent-tests--write-image file 'linux "aarch64")
+          (should-not (scrutiny-agent--binary-problem file "Linux" "arm64"))
+          (scrutiny-agent-tests--write-image file 'darwin "aarch64")
+          (should-not (scrutiny-agent--binary-problem file "Darwin" "arm64"))
+          (should (string-match-p "aarch64 binary, not x86_64"
+                                  (scrutiny-agent--binary-problem
+                                   file "Darwin" "x86_64")))
+          (should (string-match-p "Mach-O.*host is Linux"
+                                  (scrutiny-agent--binary-problem
+                                   file "Linux" "aarch64"))))
+      (delete-file file))))
+
+(ert-deftest scrutiny-agent-binary-problem-rejects-what-is-not-an-image ()
+  ;; The case that was seen in the field: GitHub's 404 page, saved
+  ;; under the binary's name by `url-copy-file', streamed to the host
+  ;; and installed over a working agent.  It is named for what it is.
+  (let ((file (make-temp-file "scra-404")))
+    (unwind-protect
+        (progn
+          (with-temp-file file (insert "Not Found"))
+          (let ((problem (scrutiny-agent--binary-problem file "Linux" "x86_64")))
+            (should problem)
+            (should (string-search file problem))
+            (should (string-search "9 bytes" problem))
+            (should (string-search "Not Found" problem))
+            (should (string-search "release asset that does not exist" problem)))
+          (with-temp-file file (insert ""))
+          (should (string-search "is empty"
+                                 (scrutiny-agent--binary-problem file)))
+          (with-temp-file file
+            (insert "#!/bin/sh\necho 'some other tool 1.0'\n")
+            (insert (make-string 100 ?#)))
+          (should (string-search "not an ELF or Mach-O"
+                                 (scrutiny-agent--binary-problem file))))
+      (delete-file file))))
+
+(ert-deftest scrutiny-agent-explicit-binary-must-be-an-image ()
+  (let ((file (make-temp-file "scra-explicit-text")))
+    (unwind-protect
+        (progn
+          (with-temp-file file (insert "Not Found"))
+          (let ((err (should-error (scrutiny-agent--local-binary
+                                    (list :local-binary file) "x86_64"))))
+            (should (string-search file (error-message-string err)))
+            (should (string-search "Not Found" (error-message-string err))))
+          ;; The right image for the wrong host is refused before any
+          ;; transfer, naming both sides.
+          (scrutiny-agent-tests--write-image file 'linux "aarch64")
+          (let ((err (should-error (scrutiny-agent--local-binary
+                                    (list :local-binary file) "x86_64" "Linux"))))
+            (should (string-search "aarch64 binary, not x86_64"
+                                   (error-message-string err))))
+          (should (equal (scrutiny-agent--local-binary
+                          (list :local-binary file) "aarch64" "Linux")
+                         (expand-file-name file))))
+      (delete-file file))))
+
+(ert-deftest scrutiny-agent-cached-404-page-is-discarded ()
+  ;; An older client cached the 404 body.  It is deleted rather than
+  ;; served, and with downloads off the error says what was thrown away.
+  (let* ((dir (make-temp-file "scra-cache" t))
+         (scrutiny-agent-bundled-binary-directory nil)
+         (scrutiny-agent-cache-directory dir)
+         (scrutiny-agent-binary-version "9.9.9")
+         (scrutiny-agent-download-releases nil)
+         (cached (expand-file-name "scrutiny-agent-9.9.9-x86_64" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file cached (insert "Not Found"))
+          (with-temp-file (concat cached ".sha256") (insert "junk\n"))
+          (let ((err (should-error (scrutiny-agent--local-binary nil "x86_64"))))
+            (should (string-search "Not Found" (error-message-string err)))
+            (should (string-search "build-agents.sh" (error-message-string err))))
+          (should-not (file-exists-p cached))
+          (should-not (file-exists-p (concat cached ".sha256")))
+          (should-not (scrutiny-agent-installed-binaries)))
+      (delete-directory dir t))))
+
+(defun scrutiny-agent-tests--with-fake-http (responses body)
+  "Run BODY with `url-retrieve-synchronously' answering from RESPONSES.
+RESPONSES is an alist of URL to (STATUS . BODY-STRING); an unlisted
+URL is a 404 with GitHub's body, which is what the real thing does."
+  (cl-letf (((symbol-function 'url-retrieve-synchronously)
+             (lambda (url &rest _)
+               (let* ((r (or (cdr (assoc url responses)) '(404 . "Not Found")))
+                      (buf (generate-new-buffer " *fake-http*")))
+                 (with-current-buffer buf
+                   (set-buffer-multibyte nil)
+                   (setq-local url-http-response-status (car r))
+                   (insert (format "HTTP/1.1 %d X\r\nContent-Type: x\r\n\r\n"
+                                   (car r)))
+                   (insert (cdr r)))
+                 buf))))
+    (funcall body)))
+
+(ert-deftest scrutiny-agent-download-refuses-a-404 ()
+  ;; The release does not exist.  Nothing is written, and the error
+  ;; carries the status and the URL, not a nine-byte "binary".
+  (let* ((dir (make-temp-file "scra-cache" t))
+         (scrutiny-agent-bundled-binary-directory nil)
+         (scrutiny-agent-cache-directory dir)
+         (scrutiny-agent-binary-version "9.9.9")
+         (scrutiny-agent-download-releases t))
+    (unwind-protect
+        (scrutiny-agent-tests--with-fake-http nil
+          (lambda ()
+            (let ((err (should-error (scrutiny-agent--local-binary nil "x86_64"))))
+              (should (string-search "HTTP 404" (error-message-string err)))
+              (should (string-search "v9.9.9/scrutiny-agent-9.9.9-x86_64"
+                                     (error-message-string err))))
+            (should-not (directory-files dir nil "scrutiny"))))
+      (delete-directory dir t))))
+
+(ert-deftest scrutiny-agent-download-is-checked-against-the-sidecar ()
+  (let* ((dir (make-temp-file "scra-cache" t))
+         (scrutiny-agent-bundled-binary-directory nil)
+         (scrutiny-agent-cache-directory dir)
+         (scrutiny-agent-binary-version "9.9.9")
+         (scrutiny-agent-download-releases t)
+         (url (format scrutiny-agent-release-url-format "9.9.9" "9.9.9" "aarch64"))
+         (image (scrutiny-agent-tests--image 'linux "aarch64"))
+         (sha (secure-hash 'sha256 image))
+         (cached (expand-file-name "scrutiny-agent-9.9.9-aarch64" dir)))
+    (unwind-protect
+        (progn
+          ;; A body that does not hash to the sidecar is not cached.
+          (scrutiny-agent-tests--with-fake-http
+           `((,(concat url ".sha256") . (200 . ,(concat sha "  x\n")))
+             (,url . (200 . ,(concat image "tampered"))))
+           (lambda ()
+             (let ((err (should-error (scrutiny-agent--local-binary nil "aarch64"))))
+               (should (string-search "does not match" (error-message-string err))))
+             (should-not (file-exists-p cached))))
+          ;; The genuine one is, executable, with its sidecar beside it.
+          (scrutiny-agent-tests--with-fake-http
+           `((,(concat url ".sha256") . (200 . ,(concat sha "\n")))
+             (,url . (200 . ,image)))
+           (lambda ()
+             (should (equal (scrutiny-agent--local-binary nil "aarch64" "Linux")
+                            cached))))
+          (should (file-executable-p cached))
+          (should (equal (scrutiny-agent--file-sha256 cached) sha))
+          (should (equal (with-temp-buffer
+                           (insert-file-contents (concat cached ".sha256"))
+                           (string-trim (buffer-string)))
+                         sha))
+          ;; And the next lookup is served from the cache, no network.
+          (cl-letf (((symbol-function 'url-retrieve-synchronously)
+                     (lambda (&rest _) (error "network used"))))
+            (should (equal (scrutiny-agent--local-binary nil "aarch64") cached))))
+      (delete-directory dir t))))
 
 ;; ---------------------------------------------------------------------
 ;; Config shipped to the host
@@ -561,18 +765,60 @@
   (should (string-match-p "exited 1"
                           (scrutiny-agent--parse-verify "1 " "1.2.3"))))
 
-(defun scrutiny-agent-tests--connect-with-binary (binary)
-  "Connect a host using BINARY; return nil on success or the error text."
+(defun scrutiny-agent-tests--connect-with-binary (binary &optional unchecked)
+  "Connect a host using BINARY; return nil on success or the error text.
+UNCHECKED skips the local image check: the verify tests below feed
+the REMOTE step files the local one would refuse, and the remote
+step must still catch them for a host whose libraries or kernel
+differ from what the header promised."
   (let* ((install (make-temp-file "scra-vfy-install" t))
          (scrutiny-agent-default-config nil)
          (scrutiny-agent-hosts
           `(("vfy" :transport "sh" :install-dir ,install
              :local-binary ,binary))))
     (unwind-protect
-        (condition-case err
-            (progn (scrutiny-agent-connect "vfy") nil)
-          (error (error-message-string err)))
+        (cl-letf (((symbol-function 'scrutiny-agent--binary-problem)
+                   (if unchecked
+                       (lambda (&rest _) nil)
+                     (symbol-function 'scrutiny-agent--binary-problem))))
+          (condition-case err
+              (progn (scrutiny-agent-connect "vfy") nil)
+            (error (error-message-string err))))
       (ignore-errors (scrutiny-agent-disconnect "vfy"))
+      (delete-directory install t))))
+
+(ert-deftest scrutiny-agent-bootstrap-refuses-a-non-binary-before-streaming ()
+  :tags '(integration)
+  (skip-unless (getenv "SCRUTINY_AGENT_BIN"))
+  ;; The field failure: nothing may be sent, nothing installed, and
+  ;; the error names the local file so the user knows what to replace.
+  (let ((file (make-temp-file "scra-vfy-404"))
+        (install (make-temp-file "scra-vfy-install" t))
+        (sent nil))
+    (unwind-protect
+        (let* ((scrutiny-agent-default-config nil)
+               (scrutiny-agent-hosts
+                `(("vfy404" :transport "sh" :install-dir ,install
+                   :local-binary ,file)))
+               (reason
+                (cl-letf* ((original (symbol-function 'process-send-string))
+                           ((symbol-function 'process-send-string)
+                            (lambda (proc text)
+                              (when (string-search "__SCRB64__" text)
+                                (setq sent t))
+                              (funcall original proc text))))
+                  (with-temp-file file (insert "Not Found"))
+                  (condition-case err
+                      (progn (scrutiny-agent-connect "vfy404") nil)
+                    (error (error-message-string err))))))
+          (should reason)
+          (should (string-search file reason))
+          (should (string-search "Not Found" reason))
+          (should-not sent)
+          (should-not (directory-files install nil "scrutiny"))
+          (should-not (scrutiny-agent-connection "vfy404")))
+      (ignore-errors (scrutiny-agent-disconnect "vfy404"))
+      (delete-file file)
       (delete-directory install t))))
 
 (ert-deftest scrutiny-agent-verify-accepts-a-working-binary ()
@@ -591,7 +837,7 @@
         (progn
           (with-temp-file file (insert "#!/nonexistent/interpreter\n"))
           (set-file-modes file #o755)
-          (let ((reason (scrutiny-agent-tests--connect-with-binary file)))
+          (let ((reason (scrutiny-agent-tests--connect-with-binary file t)))
             (should reason)
             (should (string-match-p "does not run on" reason))
             ;; It names the platform and the file, so the reader knows
@@ -700,7 +946,7 @@
               (insert (unibyte-string #x7f ?E ?L ?F 2 1 1 0 0 0 0 0 0 0 0 0
                                       2 0 #xf7 0 1 0 0 0))))
           (set-file-modes file #o755)
-          (let ((reason (scrutiny-agent-tests--connect-with-binary file)))
+          (let ((reason (scrutiny-agent-tests--connect-with-binary file t)))
             (should reason)
             (should (string-match-p "architecture\\|Exec format" reason))))
       (delete-file file))))
@@ -715,7 +961,7 @@
         (progn
           (with-temp-file file (insert "#!/bin/sh\necho 'some other tool 1.0'\n"))
           (set-file-modes file #o755)
-          (let ((reason (scrutiny-agent-tests--connect-with-binary file)))
+          (let ((reason (scrutiny-agent-tests--connect-with-binary file t)))
             (should reason)
             (should (string-match-p "expected version" reason))))
       (delete-file file))))
@@ -819,14 +1065,17 @@ define-minor-mode\\) \\([^ ()\n]+\\)" nil t)
          (name "scrutiny-agent-9.9.9-x86_64"))
     (unwind-protect
         (progn
-          (with-temp-file (expand-file-name name cache) (insert "cached"))
+          (scrutiny-agent-tests--write-image
+           (expand-file-name name cache) 'linux "x86_64")
           (should (equal (scrutiny-agent--local-binary nil "x86_64")
                          (expand-file-name name cache)))
-          (with-temp-file (expand-file-name name bundle) (insert "bundled"))
+          (scrutiny-agent-tests--write-image
+           (expand-file-name name bundle) 'linux "x86_64")
           (should (equal (scrutiny-agent--local-binary nil "x86_64")
                          (expand-file-name name bundle)))
           ;; ...and an explicit :local-binary still beats both.
           (let ((explicit (make-temp-file "scra-explicit")))
+            (scrutiny-agent-tests--write-image explicit 'linux "x86_64")
             (unwind-protect
                 (should (equal (scrutiny-agent--local-binary
                                 (list :local-binary explicit) "x86_64")
@@ -843,10 +1092,12 @@ define-minor-mode\\) \\([^ ()\n]+\\)" nil t)
          (scrutiny-agent-binary-version "9.9.9"))
     (unwind-protect
         (progn
-          (with-temp-file (expand-file-name "scrutiny-agent-9.9.9-x86_64" bundle)
-            (insert "b"))
-          (with-temp-file (expand-file-name "scrutiny-agent-9.9.9-aarch64" cache)
-            (insert "c"))
+          (scrutiny-agent-tests--write-image
+           (expand-file-name "scrutiny-agent-9.9.9-x86_64" bundle)
+           'linux "x86_64")
+          (scrutiny-agent-tests--write-image
+           (expand-file-name "scrutiny-agent-9.9.9-aarch64" cache)
+           'linux "aarch64")
           (should (equal (sort (mapcar #'car (scrutiny-agent-installed-binaries))
                                #'string<)
                          '("aarch64" "x86_64"))))
