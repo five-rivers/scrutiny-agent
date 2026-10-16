@@ -118,7 +118,7 @@ likewise untested with zlib.
     handoff/bench/fetch-deps.sh
     E=handoff/bench/elpa
     for t in scrutiny-agent-tests scrutiny-agent-fs-tests scrutiny-agent-magit-tests \
-             scrutiny-agent-ui-tests scrutiny-agent-eglot-tests; do
+             scrutiny-agent-ui-tests scrutiny-agent-eglot-tests scrutiny-agent-remote-tests; do
       emacs -Q --batch -L emacs -L $E/magit/lisp -L $E/compat -L $E/llama -L $E/cond-let \
             -L $E/transient/lisp -L $E/with-editor/lisp \
             -l emacs/$t.el -f ert-run-tests-batch-and-exit </dev/null

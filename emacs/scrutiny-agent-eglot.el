@@ -40,7 +40,19 @@
 ;;; Code:
 
 (require 'scrutiny-agent)
-(require 'eglot)
+
+;; eglot is deliberately not required here.  Loading it pulls in
+;; project, xref, flymake and jsonrpc, all of which ship with Emacs and
+;; all of which users commonly install newer copies of (eglot itself
+;; requires them with `require-with-check' on Emacs 30).  If this file
+;; loaded eglot during init, ahead of the package manager putting those
+;; newer copies on `load-path', the built-in copies would already be
+;; in `features' and eglot's own load would then fail with "Feature
+;; `project' is now provided by a different file".  So this file only
+;; declares what it needs, and `scrutiny-agent-eglot-setup' registers
+;; the contacts from `with-eval-after-load', when eglot -- whichever
+;; copy the user ends up with -- loads.
+(defvar eglot-server-programs)
 
 (defgroup scrutiny-agent-eglot nil
   "Eglot over scrutiny-agent LSP tunnels."
@@ -187,12 +199,20 @@ behave exactly as before."
                            (scrutiny-agent-eglot--bridge host workspace lang)))
         fallback))))
 
-;;;###autoload
-(defun scrutiny-agent-eglot-setup ()
-  "Register agent-tunneled contacts for every language in
-`scrutiny-agent-eglot-languages', preserving eglot's existing entry
-as the non-remote fallback."
-  (interactive)
+;; The entries registered by the last `scrutiny-agent-eglot--register',
+;; so a repeat (a second `scrutiny-agent-eglot-setup', or
+;; `scrutiny-agent-eglot-languages' edited and setup rerun) replaces
+;; them instead of stacking a copy whose fallback is the previous copy.
+(defvar scrutiny-agent-eglot--entries nil)
+
+(defun scrutiny-agent-eglot--register ()
+  "Put the tunneled contacts on `eglot-server-programs'.
+Requires eglot to be loaded; `scrutiny-agent-eglot-setup' sees to
+that."
+  (setq eglot-server-programs
+        (cl-set-difference eglot-server-programs
+                           scrutiny-agent-eglot--entries :test #'eq))
+  (setq scrutiny-agent-eglot--entries nil)
   (dolist (entry scrutiny-agent-eglot-languages)
     (let* ((modes (car entry))
            (existing (cdr (cl-find-if
@@ -203,9 +223,23 @@ as the non-remote fallback."
                                                                  (list k))
                                                     (list k))))
                                         modes)))
-                           eglot-server-programs))))
-      (add-to-list 'eglot-server-programs
-                   (cons modes (scrutiny-agent-eglot-contact existing))))))
+                           eglot-server-programs)))
+           (new (cons modes (scrutiny-agent-eglot-contact existing))))
+      (push new scrutiny-agent-eglot--entries)
+      (push new eglot-server-programs))))
+
+;;;###autoload
+(defun scrutiny-agent-eglot-setup ()
+  "Register agent-tunneled contacts for every language in
+`scrutiny-agent-eglot-languages', preserving eglot's existing entry
+as the non-remote fallback.
+
+Takes effect when eglot loads (immediately if it already has), so
+calling this from init does not itself load eglot or anything eglot
+depends on -- see the note at the top of this file."
+  (interactive)
+  (with-eval-after-load 'eglot
+    (scrutiny-agent-eglot--register)))
 
 (provide 'scrutiny-agent-eglot)
 ;;; scrutiny-agent-eglot.el ends here

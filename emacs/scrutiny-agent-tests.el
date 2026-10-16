@@ -632,6 +632,60 @@
     ;; The transport is gone with its connection.
     (should-not (scrutiny-agent-connection "pty"))))
 
+(ert-deftest scrutiny-agent-transport-that-dies-reports-its-stderr ()
+  ;; An ssh whose host is down, unresolvable, or refusing the key says
+  ;; so on stderr and exits with nothing on stdout.  The connect used
+  ;; to report `transport died; transcript:' and an empty transcript,
+  ;; which told the user nothing; the stderr went to a buffer the
+  ;; error never named.  The error now carries the transport command,
+  ;; its exit status and its stderr.
+  ;; tsh writes its errors in colour; the escapes are stripped.
+  (let* ((transport "printf '\\033[31mERROR: \\033[0mno SSH auth methods loaded, are you logged in?\\n' >&2; exit 255")
+         (scrutiny-agent-default-config nil)
+         (scrutiny-agent-hosts `(("down" :transport ,transport)))
+         (t0 (float-time))
+         (reason (unwind-protect
+                     (condition-case err
+                         (progn (scrutiny-agent-connect "down") nil)
+                       (error (error-message-string err)))
+                   (ignore-errors (scrutiny-agent-disconnect "down")))))
+    (should reason)
+    (should (string-search "transport died" reason))
+    (should (string-search "exit status 255" reason))
+    (should (string-search "ERROR: no SSH auth methods loaded" reason))
+    (should-not (string-search "\e[" reason))
+    (should (string-search transport reason))
+    (should (string-search "transcript: (nothing)" reason))
+    ;; Only what the transport wrote: not Emacs's own note that the
+    ;; stderr pipe closed.
+    (should-not (string-search "Process scrutiny-agent" reason))
+    ;; Reported from the exit, not from the deadline.
+    (should (< (- (float-time) t0) 10))
+    (should-not (scrutiny-agent-connection "down"))))
+
+(ert-deftest scrutiny-agent-transport-that-hangs-reports-its-stderr ()
+  ;; The other failure shape: the transport is alive but silent on
+  ;; stdout -- ssh waiting at a host-key or password prompt, which it
+  ;; writes to stderr.  The deadline fires; the prompt must be in the
+  ;; error, or the user is left guessing why nothing happened.
+  (let* ((transport "echo 'Are you sure you want to continue connecting (yes/no)?' >&2; sleep 30")
+         (scrutiny-agent-default-config nil)
+         (scrutiny-agent-hosts `(("prompt" :transport ,transport)))
+         (reason (cl-letf (((symbol-function 'scrutiny-agent--wait-line)
+                            (let ((orig (symbol-function 'scrutiny-agent--wait-line)))
+                              (lambda (proc state marker _timeout &optional echo-of)
+                                (funcall orig proc state marker 1 echo-of)))))
+                   (unwind-protect
+                       (condition-case err
+                           (progn (scrutiny-agent-connect "prompt") nil)
+                         (error (error-message-string err)))
+                     (ignore-errors (scrutiny-agent-disconnect "prompt"))))))
+    (should reason)
+    (should (string-search "timed out waiting for __SCRA_PROBE__" reason))
+    (should (string-search "continue connecting" reason))
+    (should-not (string-search "exit status" reason))
+    (should-not (scrutiny-agent-connection "prompt"))))
+
 (ert-deftest scrutiny-agent-verify-rejects-a-wrong-architecture-binary ()
   :tags '(integration)
   (skip-unless (getenv "SCRUTINY_AGENT_BIN"))

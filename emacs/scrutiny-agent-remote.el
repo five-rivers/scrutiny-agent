@@ -45,10 +45,17 @@
 (require 'scrutiny-agent-ops)
 (require 'scrutiny-agent-ui)
 (require 'scrutiny-agent-fs)
-(require 'scrutiny-agent-xref)
 
-;; Optional companions: loaded at setup time when present, so magit and
-;; eglot stay soft dependencies.
+;; Nothing here may load project, xref, eglot, flymake or jsonrpc.  They
+;; ship with Emacs, users install newer copies of them, and eglot (via
+;; `require-with-check' on Emacs 30) refuses to load if a built-in copy
+;; got into `features' before the package manager put the newer one on
+;; `load-path'.  This file is `require'd from init, often before that
+;; happens, so: the xref/eldoc/imenu backends come in through the
+;; `scrutiny-agent-code-mode' autoload (scrutiny-agent-ui.el) the first
+;; time they are turned on, and the eglot companion registers itself
+;; from `with-eval-after-load'.  `scrutiny-agent-remote-tests.el'
+;; checks this in a fresh Emacs.
 (declare-function scrutiny-agent-eglot-setup "scrutiny-agent-eglot")
 (declare-function scrutiny-agent-magit-mode "scrutiny-agent-magit")
 (defvar scrutiny-agent-magit-mode)
@@ -160,13 +167,18 @@ to the derived argv."
   (scrutiny-agent-fs-mode 1)
 
   ;; git.  Not conditional on magit being installed: the routing lives
-  ;; behind `process-file', so it serves whatever runs git there.
-  (when (require 'scrutiny-agent-magit nil t)
-    (scrutiny-agent-magit-mode 1))
+  ;; behind `process-file', so it serves whatever runs git there.  Both
+  ;; companions are this package's own files and depend on nothing
+  ;; outside it, so a failure to load one is a bug to hear about, not a
+  ;; reason to quietly leave that path on TRAMP.
+  (require 'scrutiny-agent-magit)
+  (scrutiny-agent-magit-mode 1)
 
-  ;; LSP through the tunnel, for the modes eglot knows.
-  (when (require 'scrutiny-agent-eglot nil t)
-    (scrutiny-agent-eglot-setup))
+  ;; LSP through the tunnel, for the modes eglot knows.  Registered
+  ;; when eglot loads; this does not load eglot (see the top of the
+  ;; file for why that matters).
+  (require 'scrutiny-agent-eglot)
+  (scrutiny-agent-eglot-setup)
 
   (message "scrutiny-agent: configured %s"
            (string-join (mapcar #'car hosts) ", ")))

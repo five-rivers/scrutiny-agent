@@ -43,6 +43,7 @@
 
 ;;; Code:
 
+(require 'ansi-color)
 (require 'cl-lib)
 (require 'subr-x)
 
@@ -744,6 +745,42 @@ protocol cannot run over one.  Teleport does this for a plain `tsh ssh \
 HOST' (even with --no-tty): give it an explicit command, e.g. `%s sh'"
          name transport transport))
 
+(defun scrutiny-agent--transport-stderr (proc)
+  "What the transport PROC has written to stderr so far, or nil.
+The buffer is recorded on PROC at connect; the stderr pipe is its
+own process, so it is drained first: when ssh exits, its last words
+may still be in flight when the transport's death is noticed."
+  (let ((buf (process-get proc 'scrutiny-agent-stderr)))
+    (when (buffer-live-p buf)
+      (let ((sp (get-buffer-process buf)))
+        (when sp (accept-process-output sp 0.2)))
+      ;; tsh colours its errors; the escapes are noise in a message.
+      (let ((text (string-trim (ansi-color-filter-apply
+                                (with-current-buffer buf (buffer-string))))))
+        (unless (string-empty-p text) text)))))
+
+(defun scrutiny-agent--bootstrap-failure (proc state what)
+  "Signal a bootstrap error: WHAT happened, then every fact that
+explains it -- the transport command, its exit status when it has
+one, what it wrote to stderr, and the pre-exec transcript.
+
+An ssh that cannot reach its host says why on stderr and exits with
+nothing on stdout; an error reporting only the empty transcript
+leaves the user with `transport died' and no idea whether the host
+is down, the name does not resolve, or a key was refused."
+  (let ((transcript (car state))
+        (stderr (scrutiny-agent--transport-stderr proc)))
+    (error "Scrutiny-agent bootstrap: %s%s.  Transport: %s%s%s"
+           what
+           (if (process-live-p proc)
+               ""
+             (format " (exit status %d)" (process-exit-status proc)))
+           (process-get proc 'scrutiny-agent-transport)
+           (if stderr (format "\nstderr:\n%s" stderr) "")
+           (if (string-empty-p transcript)
+               "\ntranscript: (nothing)"
+             (format "\ntranscript:\n%s" transcript)))))
+
 (defun scrutiny-agent--wait-line (proc state marker timeout &optional echo-of)
   "Wait until STATE's transcript contains a line starting with MARKER;
 return the rest of that line.  STATE is a cons cell whose car
@@ -763,11 +800,10 @@ diagnosis, not a timeout: fail at once, naming the fix."
           (when (string-prefix-p marker line)
             (throw 'got (string-trim (substring line (length marker))))))
         (when (> (float-time) deadline)
-          (error "Scrutiny-agent bootstrap: timed out waiting for %s; transcript:\n%s"
-                 marker (car state)))
+          (scrutiny-agent--bootstrap-failure
+           proc state (format "timed out waiting for %s" marker)))
         (unless (process-live-p proc)
-          (error "Scrutiny-agent bootstrap: transport died; transcript:\n%s"
-                 (car state)))
+          (scrutiny-agent--bootstrap-failure proc state "transport died"))
         (accept-process-output proc 0.1)))))
 
 (defun scrutiny-agent--install-config (proc state host-plist name install-dir)
@@ -973,7 +1009,14 @@ at it if this platform is expected to work"
                     :stderr stderr-buf)))
         (let ((sp (get-buffer-process stderr-buf)))
 	  (when sp
-	    (set-process-query-on-exit-flag sp nil)))
+	    (set-process-query-on-exit-flag sp nil)
+            ;; The default sentinel appends "Process ... finished" to
+            ;; the buffer; that is not something the transport said.
+            (set-process-sentinel sp #'ignore)))
+        ;; A bootstrap failure reports these; nothing else on the
+        ;; process says where its stderr went or what it was running.
+        (process-put proc 'scrutiny-agent-stderr stderr-buf)
+        (process-put proc 'scrutiny-agent-transport transport)
         (condition-case err
             (scrutiny-agent--finish-connect proc plist name)
           (error

@@ -39,6 +39,15 @@ That is the whole configuration. It registers the host, derives the
 agent's argv from `:roots`, and turns on the file accelerator, magit
 routing, eglot tunneling, and the xref/eldoc/imenu backends.
 
+It can go anywhere in your init, before or after your package manager
+runs. The setup loads none of eglot, project, xref, flymake or jsonrpc
+itself: the eglot contacts are registered when eglot loads, and the
+xref/eldoc/imenu backends when `scrutiny-agent-code-mode` is first
+turned on. That matters because those libraries ship with Emacs and
+you may install newer copies; eglot (Emacs 30) refuses to load if the
+built-in copy was already loaded before the newer one appeared on
+`load-path` ("Feature `project' is now provided by a different file").
+
 Then use Emacs exactly as you always have — `C-x C-f
 /ssh:devbox:~/src/proj/main.py`, `C-x C-s`, `M-x magit-status`, `M-.`,
 `M-x dired` — and all of it rides one connection.
@@ -348,7 +357,12 @@ This is the answer to "I just set up a new host; does it work?"
 - `*scrutiny-agent-log[HOST]*` — client-side log, including the full
   pre-exec bootstrap transcript. Errors are never swallowed.
 - `*scrutiny-agent-stderr[HOST]*` — the transport's stderr (ssh/tsh
-  noise, agent startup lines).
+  noise, agent startup lines). A bootstrap that fails before the agent
+  starts quotes this in its error, with the transport command and its
+  exit status: `transport died (exit status 1)` followed by
+  `ERROR: ssh: cert has expired` is tsh asking for a `tsh login`;
+  `timed out waiting for __SCRA_PROBE__` over a host-key prompt is ssh
+  waiting for an answer it can never get.
 - `M-x scrutiny-agent-remote-logs` — the agent's own log (needs
   `--log` in `:agent-args`).
 - `M-x scrutiny-agent-credential-selftest` — drives the whole
@@ -409,6 +423,9 @@ SCRUTINY_AGENT_BIN=$PWD/build/agent/scrutiny-agent \
 SCRUTINY_AGENT_BIN=$PWD/build/agent/scrutiny-agent \
   emacs -Q --batch -L emacs -l emacs/scrutiny-agent-fs-tests.el \
   -f ert-run-tests-batch-and-exit          # file handler
+
+emacs -Q --batch -L emacs -l emacs/scrutiny-agent-remote-tests.el \
+  -f ert-run-tests-batch-and-exit          # one-call setup: what it loads
 ```
 
 ### Linting

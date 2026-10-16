@@ -20,6 +20,7 @@
 (require 'python)
 (require 'scrutiny-agent)
 (require 'scrutiny-agent-fs)
+(require 'eglot)                        ; the companion no longer loads it
 (require 'scrutiny-agent-eglot)
 
 (defmacro scrutiny-agent-eglot-tests--with-server (varlist &rest body)
