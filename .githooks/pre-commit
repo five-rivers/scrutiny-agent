@@ -1,0 +1,22 @@
+#!/bin/sh
+# Pre-commit: run the Emacs Lisp lint CI runs, so a commit that would
+# turn CI red is refused here first.  Only when the commit touches
+# emacs/*.el; the lint reads the working tree, so stage everything you
+# mean to commit before committing.
+#
+# Enable once per clone:   git config core.hooksPath .githooks
+# Skip for one commit:     git commit --no-verify
+# Add elsa (slow):         SCRUTINY_PRECOMMIT_ELSA=1 git commit ...
+set -u
+root="$(git rev-parse --show-toplevel)"
+if git diff --cached --name-only --diff-filter=ACMR -- 'emacs/*.el' \
+   | grep -q .; then
+    args=""
+    [ "${SCRUTINY_PRECOMMIT_ELSA:-0}" = "1" ] && args="--elsa"
+    echo "pre-commit: linting emacs/*.el (scripts/lint-elisp.sh ${args})"
+    if ! "${root}/scripts/lint-elisp.sh" ${args}; then
+        echo "pre-commit: lint failed; fix it, or --no-verify to commit anyway" >&2
+        exit 1
+    fi
+fi
+exit 0

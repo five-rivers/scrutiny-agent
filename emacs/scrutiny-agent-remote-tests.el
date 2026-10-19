@@ -131,5 +131,27 @@ fallback is eglot's original entry, not our own previous one."
                     (setq major-mode 'python-mode)
                     (funcall contact)))))))
 
+(ert-deftest scrutiny-agent-remote-setup-keeps-every-binary-key ()
+  "The setup says it takes the keys `scrutiny-agent-hosts' takes.
+A key it dropped would send the host down the download path with no
+word of why, so each binary key is checked through to the host entry."
+  (let ((result (scrutiny-agent-remote-tests--emacs
+                 '((require 'scrutiny-agent-remote)
+                   (scrutiny-agent-remote-setup
+                    '(("devbox" :transport "ssh devbox"
+                       :install-dir "$HOME/.x"
+                       :local-binary "/l/scrutiny-agent"
+                       :remote-binary "~/r/scrutiny-agent")))
+                   (let ((h (cdr (assoc "devbox" scrutiny-agent-hosts))))
+                     (dolist (key '(:transport :install-dir
+                                    :local-binary :remote-binary))
+                       (princ (format "%s=%S\n" key (plist-get h key)))))))))
+    (should (= 0 (car result)))
+    (should (string-match-p "^:install-dir=\"\\$HOME/.x\"$" (cdr result)))
+    (should (string-match-p "^:local-binary=\"/l/scrutiny-agent\"$"
+                            (cdr result)))
+    (should (string-match-p "^:remote-binary=\"~/r/scrutiny-agent\"$"
+                            (cdr result)))))
+
 (provide 'scrutiny-agent-remote-tests)
 ;;; scrutiny-agent-remote-tests.el ends here

@@ -151,6 +151,17 @@ this side with the file named, and nothing is sent or installed.
                   ("aarch64" . "~/agents/scrutiny-agent-0.2.0-aarch64"))
   ```
 
+- **Use a binary already on the host**: `:remote-binary
+  "$HOME/src/scrutiny-agent/build/agent/scrutiny-agent"` (a shell
+  expression; a leading `~/` becomes `$HOME/`). Nothing is looked up,
+  hashed or streamed from this side, and the bootstrap drops the hash
+  gate's round trip. The binary is run once with `--version` and must
+  report the protocol this client speaks
+  (`scrutiny-agent-protocol-version`); its version is yours to choose.
+  One that reports another protocol, or does not run, is an error at
+  connect that names the path. This takes precedence over
+  `:local-binary`.
+
 `M-x eval-expression (scrutiny-agent-installed-binaries)` lists what
 you have locally.
 
@@ -402,13 +413,27 @@ must already be installed on the remote host.
 
 ## Development
 
-Point a host at a locally built agent instead of a release:
+Point a host at a locally built agent instead of a release, or at one
+built on the host itself:
 
 ```elisp
 (setq scrutiny-agent-hosts
       '(("local" :transport "sh"
                  :local-binary "~/src/scrutiny-agent/build/agent/scrutiny-agent"
-                 :agent-args ("--git-exec-preset" "magit"))))
+                 :agent-args ("--git-exec-preset" "magit"))
+        ("devbox" :transport "ssh devbox"
+                  :remote-binary "~/src/scrutiny-agent/build/agent/scrutiny-agent")))
+```
+
+`:local-binary` names a file on this machine and streams it; a path
+that only exists on the host is a `:remote-binary`.
+
+Lint before committing, the same way CI does. Enabling the hook once
+per clone makes every commit that touches `emacs/*.el` run it:
+
+```sh
+git config core.hooksPath .githooks   # once
+scripts/lint-elisp.sh                 # or by hand; --elsa adds the slow stage
 ```
 
 Tests (the integration ones need a built agent; they use a local `sh`

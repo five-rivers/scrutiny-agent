@@ -74,6 +74,14 @@ and the binary is the version that was intended. The exit status is
 returned with the output flattened to one line, so the client reports
 *why* rather than timing out at `meta.hello` twenty seconds later.
 
+A client may instead be pointed at a binary already on the host
+(the Emacs client's `:remote-binary`). Steps 2 and 3 are then skipped
+outright, with nothing hashed or streamed, and step 4 runs that path.
+The check in step 4 changes with it: a streamed binary must report the
+version the client sent, while a host-built one may be any version
+and must report the client's `proto` number. Step 5 and 6 are
+unchanged.
+
 **Step 6**'s marker closes a real race. The shell reads its script
 from the same pipe the protocol will use; anything written before it
 has consumed the exec line can be swallowed by its read-ahead and

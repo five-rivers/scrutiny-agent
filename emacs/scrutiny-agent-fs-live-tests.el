@@ -1,17 +1,25 @@
-;;; scrutiny-agent-fs-test.el --- Tests for scrutiny-agent-fs  -*- lexical-binding: t; -*-
+;;; scrutiny-agent-fs-live-tests.el --- Live-host checks for scrutiny-agent-fs  -*- lexical-binding: t; -*-
 
 ;;; Commentary:
-;; Comprehensive tests that catch real bugs, not just happy paths.
-;; Run with: emacs --batch -l ~/.emacs -l scrutiny-agent-fs-test.el -f scrutiny-agent-fs-run-all-tests
+;; A manual harness run against a LIVE host from your own Emacs config;
+;; not ERT, and not part of the package or the lint (the `-tests.el'
+;; suffix keeps it out of both).  The ERT suite in
+;; scrutiny-agent-fs-tests.el is what CI runs.
+;;
+;; Run with:
+;;   emacs --batch -l ~/.emacs -l scrutiny-agent-fs-live-tests.el \
+;;         -f scrutiny-agent-fs-run-all-tests
 
 ;;; Code:
 
 (require 'scrutiny-agent)
 (require 'scrutiny-agent-fs)
 
-;; Declare variables that company-mode would define, so we can test them
-;; even if company isn't fully initialized in batch mode
-(defvar company-candidates nil "Company completion candidates (for testing).")
+;; Variables other packages define, bound dynamically by tests below
+;; whether or not those packages are loaded in batch.
+(defvar company-candidates)
+(defvar ivy--index)
+(defvar eglot-server-programs)
 
 (defvar scrutiny-agent-fs-test-results nil
   "Alist of (test-name . (passed . message)).")
@@ -617,12 +625,12 @@
     (scrutiny-agent-fs--track-delegations
      (lambda ()
        ;; Simulate what find-file does
-       (let* ((expanded (expand-file-name path))
-              (truename (file-truename expanded))
-              (exists (file-exists-p expanded))
-              (readable (file-readable-p expanded))
-              (attrs (file-attributes expanded))
-              (modes (file-modes expanded)))
+       (let ((expanded (expand-file-name path)))
+         (file-truename expanded)
+         (file-exists-p expanded)
+         (file-readable-p expanded)
+         (file-attributes expanded)
+         (file-modes expanded)
          ;; Now try to read the file
          (with-temp-buffer
            (insert-file-contents expanded))
@@ -705,7 +713,8 @@
 
 (defun scrutiny-agent-fs--audit-handlers ()
   "Audit every handler in scrutiny-agent-fs-operations for TRAMP delegation.
-Returns list of (operation . potential-issue) for operations that might delegate.
+Returns a list of (OPERATION . POTENTIAL-ISSUE) for operations that
+might delegate.
 
 Only flags READ operations that require network access. Pure path manipulation
 operations (like `expand-file-name') are OK to delegate unconditionally.
@@ -825,5 +834,5 @@ blocking is acceptable for those."
       (when (> failed 0)
         (kill-emacs 1)))))
 
-(provide 'scrutiny-agent-fs-test)
-;;; scrutiny-agent-fs-test.el ends here
+(provide 'scrutiny-agent-fs-live-tests)
+;;; scrutiny-agent-fs-live-tests.el ends here

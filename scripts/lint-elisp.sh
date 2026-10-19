@@ -34,7 +34,11 @@
 #   --elsa         also run elsa, failing on any file above its baseline
 #   --elsa-update  rewrite emacs/.elsa-baseline from this run instead
 # ELSA_TIMEOUT (default 300) bounds each file's analysis; a file that
-# exceeds it is recorded as not analysed, never as clean.
+# exceeds it, or an Elsa that crashes, is recorded as not analysed,
+# never as clean.
+#
+# Run it before committing: .githooks/pre-commit does, once enabled with
+#   git config core.hooksPath .githooks
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,6 +48,7 @@ STRICT=0
 STATUS=0
 WITH_ELSA=0
 UPDATE_BASELINE=0
+NOT_ANALYSED=0
 BASELINE="${ROOT}/emacs/.elsa-baseline"
 ELSA_TIMEOUT="${ELSA_TIMEOUT:-300}"
 
@@ -86,6 +91,23 @@ for d in "${LINT_DIR}"/*/; do [ -d "${d}" ] && LOADS+=(-L "${d}"); done
 have() {
     "${EMACS}" -Q --batch "${LOADS[@]}" --eval \
         "(kill-emacs (if (locate-library \"$1\") 0 1))" >/dev/null 2>&1
+}
+
+# `timeout SECS CMD...', exiting 124 on expiry. coreutils' timeout is
+# not on a stock Mac, and without this fallback the elsa step below
+# failed with 127 -- which the old code scored as a clean file.
+bounded() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$@"
+        return
+    fi
+    local secs="$1"; shift
+    "$@" & local pid=$!
+    ( sleep "${secs}"; kill -9 "${pid}" 2>/dev/null ) & local timer=$!
+    wait "${pid}"; local rc=$?
+    kill "${timer}" 2>/dev/null; wait "${timer}" 2>/dev/null
+    [ "${rc}" -eq 137 ] && return 124
+    return "${rc}"
 }
 
 # --- byte-compile ----------------------------------------------------
@@ -144,9 +166,12 @@ if [ "${WITH_ELSA}" -eq 1 ]; then
     if have elsa; then
         : > "${BASELINE}.new"
         for f in "${FILES[@]}"; do
-            raw="$(timeout "${ELSA_TIMEOUT}" \
+            # Elsa colours its output and can emit NUL bytes; both are
+            # stripped before anything is matched or stored.
+            raw="$(bounded "${ELSA_TIMEOUT}" \
                     "${EMACS}" -Q --batch "${LOADS[@]}" -L . -l elsa \
-                    -f elsa-run "${f}" 2>&1)"
+                    -f elsa-run "${f}" 2>&1 | tr -d '\\0' \
+                   | sed 's/\x1b\[[0-9;]*m//g')"
             rc=$?
             was="$(awk -v f="${f}" '$1 == f {print $2}' "${BASELINE}" \
                    2>/dev/null)"
@@ -159,15 +184,31 @@ if [ "${WITH_ELSA}" -eq 1 ]; then
                 printf '%s timeout\n' "${f}" >> "${BASELINE}.new"
                 printf '    %-34s not analysed (timed out after %ss)\n' \
                        "${f}" "${ELSA_TIMEOUT}"
+                NOT_ANALYSED=1
                 continue
             fi
-            out="$(printf '%s\n' "${raw}" | sed 's/\x1b\[[0-9;]*m//g' \
-                   | grep -E ":(error|warning|notice):")"
+            # Elsa that dies part-way -- a worker crashing on a core
+            # file it cannot parse, a missing `timeout', a load error --
+            # reports nothing, and nothing is not a clean file. Only a
+            # run that reached its summary counts; anything else is
+            # recorded as not analysed, with the reason.
+            if ! printf '%s\n' "${raw}" | grep -qE '^(\[[0-9 ]+/[0-9]+\]|Done after|Elsa )' \
+               || printf '%s\n' "${raw}" | grep -qE 'errored with|^Error:|^  signal\(|^Debugger'; then
+                printf '%s error\n' "${f}" >> "${BASELINE}.new"
+                printf '    %-34s not analysed (elsa failed, exit %s): %s\n' \
+                       "${f}" "${rc}" \
+                       "$(printf '%s\n' "${raw}" \
+                          | grep -E 'errored with|^Error|^Cannot|^Worker' \
+                          | head -1 | cut -c1-80)"
+                NOT_ANALYSED=1
+                continue
+            fi
+            out="$(printf '%s\n' "${raw}" | grep -E ":(error|warning|notice):")"
             n="$(printf '%s' "${out}" | grep -c . || true)"
             printf '%s %s\n' "${f}" "${n}" >> "${BASELINE}.new"
             # A file recorded as never analysed has no count to regress
             # against; report it and leave the baseline to be updated.
-            if [ "${was}" = "timeout" ]; then
+            if [ "${was}" = "timeout" ] || [ "${was}" = "error" ]; then
                 printf '    %-34s %s findings (was not analysed)\n' \
                        "${f}" "${n}"
                 continue
@@ -197,6 +238,9 @@ if [ "${WITH_ELSA}" -eq 1 ]; then
 fi
 
 echo ""
+if [ "${NOT_ANALYSED}" -eq 1 ]; then
+    echo "elsa: some files were NOT analysed (see above); their baseline is unchanged"
+fi
 if [ "${STATUS}" -eq 0 ]; then
     echo "lint: clean"
 else

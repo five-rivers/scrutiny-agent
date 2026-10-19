@@ -403,11 +403,30 @@ Tallies for this round (macOS): see the end of this file.
 - The agent binary is pushed to the host hash-gated; a host keeps a
   stale binary only if the client is pointed at one. Use
   `:local-binary` (or `AGENT_BIN` in the harness) while developing so
-  the client and agent cannot drift.
+  the client and agent cannot drift. `:remote-binary` is the other
+  mode: a binary built on the host is run as it is, with no hash gate
+  (one round trip fewer) and no version match, only a `--version`
+  check that it speaks `scrutiny-agent-protocol-version`.
 - Features are negotiated through `hello.features`
   (`scrutiny-agent-feature-p`). Any new behaviour inside an existing
   method needs a feature name, and the client must still work against
   an agent without it.
+- CI fails on any byte-compile, relint or package-lint finding in
+  `emacs/*.el` (`scripts/lint-elisp.sh`). Enable the hook once per
+  clone, `git config core.hooksPath .githooks`, and it runs before
+  every commit that touches those files. Files named `*-tests.el` are
+  outside the package and the lint.
+- The elsa stage of that lint is dead on Emacs 30: elsa 20250717
+  crashes parsing `ansi-color.el` (a `pcase` it calls "Invalid form")
+  before reaching any project file. The script now reports such files
+  as "not analysed (elsa failed)" instead of scoring them zero, which
+  it did until 2026-10-16: every "0 findings (improved)" line in a CI
+  log from before then was a crash, not a clean file. The baseline is
+  unchanged until elsa works again; `--elsa-update` then.
+- `scrutiny-agent-download-releases` is on by default and no release
+  exists at five-rivers; the client refuses a 404 (and anything that is
+  not an ELF/Mach-O image for the host) rather than stream it, which
+  it did until 2026-10-16.
 
 ## 8. Round-two tallies (macOS, Emacs 30.2, 2026-10-13)
 

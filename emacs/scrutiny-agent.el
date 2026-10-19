@@ -31,7 +31,8 @@
 ;; OS/arch is probed over the pipe, the matching release binary is
 ;; downloaded locally (or taken from :local-binary), streamed across
 ;; as base64 inside a quoted heredoc, hash-gated with sha256, and
-;; exec'd.  No scp, no second channel.
+;; exec'd.  No scp, no second channel.  A host with :remote-binary
+;; skips all of that and runs the binary it names.
 ;;
 ;; Minimal setup:
 ;;
@@ -72,6 +73,16 @@ integration).  PLIST keys:
                  this host; an alist keyed by architecture --
                  ((\"x86_64\" . PATH) (\"aarch64\" . PATH)) -- picks by
                  the arch probed on the remote.
+  :remote-binary an agent binary already on the host, as a shell
+                 expression, e.g. \"$HOME/src/x/build/agent/scrutiny-agent\"
+                 (a leading ~/ becomes $HOME/).  Used as it is:
+                 nothing is looked up here, hashed, or streamed, and
+                 its version need not match this client's.  It is
+                 run once with --version before use, and must report
+                 the protocol this client speaks
+                 (`scrutiny-agent-protocol-version'); one that does
+                 not, or does not run there, is an error at connect.
+                 Takes precedence over :local-binary.
   :config        agent config file contents to install on this host,
                  overriding `scrutiny-agent-default-config'.  Nil
                  sends none."
@@ -504,8 +515,8 @@ empirically what a probe could only guess at -- whether the binary
 we picked actually runs there."
   "echo __SCRA_PROBE__ $(uname -s) $(uname -m)")
 
-(defun scrutiny-agent--verify-script (install-dir binary-name)
-  "Shell command running the installed binary to prove it works.
+(defun scrutiny-agent--verify-script (binary)
+  "Shell command running BINARY, a shell expression, to prove it works.
 
 `--version' is the no-op probe: it execs, exits 0, and prints the
 identity, so one line answers three separate questions -- does the
@@ -516,21 +527,38 @@ and is this the binary we think it is.
 Output is flattened to one line and prefixed with the exit status,
 so the client gets the failure reason rather than a timeout twenty
 seconds later at the handshake."
-  (format (concat "D=\"%s\"; B=\"$D/%s\"; "
+  (format (concat "B=\"%s\"; "
                   "V=$(\"$B\" --version 2>&1); R=$?; "
                   "echo \"__SCRA_VERIFY__ $R $(echo \"$V\" | tr '\\n' ' ')\"")
-          install-dir binary-name))
+          binary))
 
-(defun scrutiny-agent--parse-verify (line expected-version)
+(defun scrutiny-agent--parse-verify (line expected-version &optional protocol)
   "Interpret a `__SCRA_VERIFY__' LINE; nil when the binary is good.
-Returns a human-readable reason when it is not."
+Returns a human-readable reason when it is not.
+
+The binary answers `--version' with \"VERSION proto N\".  Without
+PROTOCOL the answer must name EXPECTED-VERSION: the binary was
+streamed from this machine, so anything else is not the file that
+was sent.  With PROTOCOL, a number, the binary is one the user built
+on the host (`:remote-binary'), whose version is theirs to choose;
+what matters is that it speaks this client's protocol, so only N is
+checked and EXPECTED-VERSION is not."
   (let* ((parts (split-string (string-trim line) " " t))
          (status (string-to-number (or (car parts) "1")))
-         (output (string-join (cdr parts) " ")))
+         (output (string-join (cdr parts) " "))
+         (spoken (and (= status 0)
+                      (string-match "\\`[^ ]+ proto \\([0-9]+\\)" output)
+                      (string-to-number (match-string 1 output)))))
     (cond
-     ((and (= status 0)
+     ((and (= status 0) (null protocol)
            (string-prefix-p (format "%s proto " expected-version) output))
       nil)
+     ((and spoken protocol (= spoken protocol))
+      nil)
+     ((and spoken protocol)
+      (format "it speaks protocol %d, but this client speaks protocol %d \
+(the binary reports: %s)"
+              spoken protocol output))
      ;; The shell's own words are more specific than anything inferred
      ;; from the status: 126 covers both `Permission denied' and `Exec
      ;; format error' (the wrong-architecture symptom), and 127 covers
@@ -544,6 +572,10 @@ library it needs, is missing: %s" output))
      ((/= status 0)
       (format "the binary exited %d: %s" status
               (if (string-empty-p output) "(no output)" output)))
+     (protocol
+      (format "expected an agent speaking protocol %d, but the binary \
+reports: %s"
+              protocol (if (string-empty-p output) "(nothing)" output)))
      (t
       (format "expected version %s, but the binary reports: %s"
               expected-version
@@ -808,7 +840,10 @@ Errors with something actionable when none of them produce a file --
 this is the step that fails first on a new machine."
   (let* ((local (plist-get host-plist :local-binary))
          (explicit (cond ((stringp local) local)
-                         ((consp local) (cdr (assoc arch local))))))
+                         ((consp local)
+                          (or (cdr (assoc arch local))
+                              (error "Scrutiny-agent: :local-binary has no \
+entry for %s, only for %s" arch (mapconcat #'car local ", ")))))))
     (cl-flet ((checked (path)
                 (let ((problem (scrutiny-agent--binary-problem
                                 path uname-s arch)))
@@ -821,7 +856,12 @@ scripts/build-agents.sh, or point :local-binary at a built agent"
        (explicit
         (let ((path (expand-file-name explicit)))
           (unless (file-exists-p path)
-            (error "Scrutiny-agent: :local-binary %s does not exist" path))
+            ;; Said in full because the natural mistake is to name a
+            ;; binary built on the host: this option is the file on
+            ;; THIS machine that gets streamed there.
+            (error "Scrutiny-agent: :local-binary %s does not exist on this \
+machine.  It names a file here, which is streamed to the host; a binary \
+built on the host itself is not what it takes" path))
           (checked path)))
        (t
         (let* ((ver scrutiny-agent-binary-version)
@@ -989,6 +1029,19 @@ server survive reconnects."
                      done))))
         (format "%s/%s" install-dir scrutiny-agent-config-name)))))
 
+(defun scrutiny-agent--remote-binary (host-plist)
+  "The `:remote-binary' of HOST-PLIST as a shell expression, or nil.
+A leading ~/ is rewritten to $HOME/: the path is expanded by the
+remote shell inside double quotes, where a tilde is a literal."
+  (let ((remote (plist-get host-plist :remote-binary)))
+    (cond ((null remote) nil)
+          ((not (stringp remote))
+           (error "Scrutiny-agent: :remote-binary must be a string naming \
+a binary on the host, not %S" remote))
+          ((string-prefix-p "~/" remote)
+           (concat "$HOME" (substring remote 1)))
+          (t remote))))
+
 (defun scrutiny-agent--bootstrap (proc host-plist name)
   "Run the pre-exec bootstrap dialogue on PROC.  Returns when the
 remote shell has exec'd the agent (the pipe then speaks JSON-RPC)."
@@ -1008,7 +1061,13 @@ remote shell has exec'd the agent (the pipe then speaks JSON-RPC)."
                        name (plist-get host-plist :transport))
                     (split-string probe)))
            (uname-s (nth 0 parts)) (uname-m (nth 1 parts))
-           (arch (or (scrutiny-agent--arch-asset uname-s uname-m)
+           ;; A host with :remote-binary runs what is already there:
+           ;; no architecture to match, no file here to hash, nothing
+           ;; to stream.  The hash gate and the install are skipped
+           ;; outright, which also removes their round trips.
+           (remote (scrutiny-agent--remote-binary host-plist))
+           (arch (or remote
+                     (scrutiny-agent--arch-asset uname-s uname-m)
                      ;; A local binary can serve a platform we publish
                      ;; nothing for -- notably a Darwin remote, or an
                      ;; architecture built by hand.
@@ -1019,38 +1078,44 @@ remote shell has exec'd the agent (the pipe then speaks JSON-RPC)."
 Supported: Linux on x86_64 or aarch64.  Build one and point :local-binary \
 at it if this platform is expected to work"
                             name uname-s uname-m)))
-           (binary (scrutiny-agent--local-binary host-plist arch uname-s))
-           (hash (scrutiny-agent--file-sha256 binary))
-           (bname (format "scrutiny-agent-%s-%s"
-                          scrutiny-agent-binary-version arch)))
-      ;; 2. Hash-check what is installed.
-      (process-send-string
-       proc (concat (scrutiny-agent--bootstrap-script install-dir bname hash)
-                    "\n"))
-      (let ((st (scrutiny-agent--wait-line proc state "__SCRA_ST__" 30)))
-        (unless (string= st "OK")
-          ;; 3. Stream the binary (base64 heredoc, hash-gated install).
-          (message "scrutiny-agent[%s]: installing agent (%s)..." name bname)
+           (binary (unless remote
+                     (scrutiny-agent--local-binary host-plist arch uname-s)))
+           (bname (unless remote
+                    (format "scrutiny-agent-%s-%s"
+                            scrutiny-agent-binary-version arch)))
+           ;; What the verify and exec steps run: a shell expression,
+           ;; expanded by the remote shell.
+           (remote-path (or remote (format "%s/%s" install-dir bname))))
+      (unless remote
+        (let ((hash (scrutiny-agent--file-sha256 binary)))
+          ;; 2. Hash-check what is installed.
           (process-send-string
-           proc (concat (scrutiny-agent--install-script
-                         install-dir bname) "\n"))
-          ;; 4 KiB base64 lines: comfortably inside every shell's
-          ;; heredoc line handling, still few enough sends to be fast.
-          (let ((b64 (with-temp-buffer
-                       (set-buffer-multibyte nil)
-                       (insert-file-contents-literally binary)
-                       (base64-encode-region (point-min) (point-max) t)
-                       (buffer-string))))
-            (dolist (chunk (scrutiny-agent--split-bytes b64 4096))
-              (process-send-string proc chunk)
-              (process-send-string proc "\n")))
-          (process-send-string proc "__SCRB64__\n")
-          (process-send-string
-           proc (concat (scrutiny-agent--install-epilogue
-                         install-dir bname hash) "\n"))
-          (let ((inst (scrutiny-agent--wait-line proc state "__SCRA_INST__" 120)))
-            (unless (string= inst "OK")
-              (error "Scrutiny-agent: install hash mismatch (got %s)" inst)))))
+           proc (concat (scrutiny-agent--bootstrap-script install-dir bname hash)
+                        "\n"))
+          (let ((st (scrutiny-agent--wait-line proc state "__SCRA_ST__" 30)))
+            (unless (string= st "OK")
+              ;; 3. Stream the binary (base64 heredoc, hash-gated install).
+              (message "scrutiny-agent[%s]: installing agent (%s)..." name bname)
+              (process-send-string
+               proc (concat (scrutiny-agent--install-script
+                             install-dir bname) "\n"))
+              ;; 4 KiB base64 lines: comfortably inside every shell's
+              ;; heredoc line handling, still few enough sends to be fast.
+              (let ((b64 (with-temp-buffer
+                           (set-buffer-multibyte nil)
+                           (insert-file-contents-literally binary)
+                           (base64-encode-region (point-min) (point-max) t)
+                           (buffer-string))))
+                (dolist (chunk (scrutiny-agent--split-bytes b64 4096))
+                  (process-send-string proc chunk)
+                  (process-send-string proc "\n")))
+              (process-send-string proc "__SCRB64__\n")
+              (process-send-string
+               proc (concat (scrutiny-agent--install-epilogue
+                             install-dir bname hash) "\n"))
+              (let ((inst (scrutiny-agent--wait-line proc state "__SCRA_INST__" 120)))
+                (unless (string= inst "OK")
+                  (error "Scrutiny-agent: install hash mismatch (got %s)" inst)))))))
       ;; 4. Verify. Run the installed binary before trusting it: this
       ;; is where a wrong architecture, a failed dynamic link, or a
       ;; truncated transfer becomes a sentence the user can act on,
@@ -1059,14 +1124,20 @@ at it if this platform is expected to work"
       ;; an install -- it costs one exec and catches a host whose
       ;; libraries moved under a previously working binary.
       (process-send-string
-       proc (concat (scrutiny-agent--verify-script install-dir bname) "\n"))
+       proc (concat (scrutiny-agent--verify-script remote-path) "\n"))
       (let* ((line (scrutiny-agent--wait-line proc state "__SCRA_VERIFY__" 60))
+             ;; A streamed binary must be the one that was sent; a
+             ;; :remote-binary must speak this client's protocol.
              (problem (scrutiny-agent--parse-verify
-                       line scrutiny-agent-binary-version)))
+                       line scrutiny-agent-binary-version
+                       (and remote scrutiny-agent-protocol-version))))
         (when problem
           (error "Scrutiny-agent[%s]: the agent binary does not run on \
-%s/%s -- %s.  (Installed as %s/%s from %s.)"
-                 name uname-s uname-m problem install-dir bname binary)))
+%s/%s -- %s.  (%s.)"
+                 name uname-s uname-m problem
+                 (if remote
+                     (format "Named by :remote-binary as %s" remote)
+                   (format "Installed as %s from %s" remote-path binary)))))
 
       ;; 5. Config. Streamed the same way as the binary and gated the
       ;; same way, so an unchanged config costs one echo rather than a
@@ -1099,8 +1170,8 @@ at it if this platform is expected to work"
             (args (mapconcat #'shell-quote-argument
                              (plist-get host-plist :agent-args) " ")))
         (process-send-string
-         proc (format "echo __SCRA_EXEC__; exec \"%s/%s\" --rpc-stdio%s %s\n"
-                      install-dir bname
+         proc (format "echo __SCRA_EXEC__; exec \"%s\" --rpc-stdio%s %s\n"
+                      remote-path
                       ;; Double-quoted, exactly like the binary beside
                       ;; it: INSTALL-DIR is a shell expression (the
                       ;; default is "$HOME/.scrutiny-agent") and must be

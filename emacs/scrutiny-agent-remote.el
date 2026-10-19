@@ -150,6 +150,8 @@ to the derived argv."
                       (list :install-dir (plist-get plist :install-dir)))
                     (when (plist-get plist :local-binary)
                       (list :local-binary (plist-get plist :local-binary)))
+                    (when (plist-get plist :remote-binary)
+                      (list :remote-binary (plist-get plist :remote-binary)))
                     (list :config (scrutiny-agent-remote--config plist)
                           :agent-args
                           (scrutiny-agent-remote--agent-args plist))))

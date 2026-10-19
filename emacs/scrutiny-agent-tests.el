@@ -339,8 +339,18 @@ for that platform; it does not run."
       (delete-directory dir t))))
 
 (ert-deftest scrutiny-agent-explicit-binary-must-exist ()
-  (should-error (scrutiny-agent--local-binary
-                 (list :local-binary "/no/such/agent") "x86_64")))
+  ;; Both misses say where the file was expected: a path that is not
+  ;; on this machine (the natural mistake is naming a binary built on
+  ;; the host), and an alist with no entry for the host's arch.
+  (let ((err (should-error (scrutiny-agent--local-binary
+                            (list :local-binary "/no/such/agent") "x86_64"))))
+    (should (string-search "/no/such/agent" (error-message-string err)))
+    (should (string-search "on this machine" (error-message-string err))))
+  (let ((err (should-error (scrutiny-agent--local-binary
+                            (list :local-binary '(("aarch64" . "/x")))
+                            "x86_64"))))
+    (should (string-search "no entry for x86_64" (error-message-string err)))
+    (should (string-search "aarch64" (error-message-string err)))))
 
 ;; ---------------------------------------------------------------------
 ;; What may be streamed: the local check on the binary
@@ -732,7 +742,8 @@ URL is a 404 with GitHub's body, which is what the real thing does."
   (should-not (scrutiny-agent--arch-asset "FreeBSD" "x86_64")))
 
 (ert-deftest scrutiny-agent-verify-script-shape ()
-  (let ((script (scrutiny-agent--verify-script "$HOME/.x" "agent-1")))
+  (let ((script (scrutiny-agent--verify-script "$HOME/.x/agent-1")))
+    (should (string-search "\"$HOME/.x/agent-1\"" script))
     ;; --version is the probe: it execs, exits 0, and names itself.
     (should (string-search "--version" script))
     (should (string-search "__SCRA_VERIFY__" script))
@@ -764,6 +775,134 @@ URL is a 404 with GitHub's body, which is what the real thing does."
   ;; Crashed.
   (should (string-match-p "exited 1"
                           (scrutiny-agent--parse-verify "1 " "1.2.3"))))
+
+(ert-deftest scrutiny-agent-verify-parsing-for-a-remote-binary ()
+  ;; A :remote-binary is whatever the user built on the host: its
+  ;; version is not ours to check, its protocol is.
+  (should-not (scrutiny-agent--parse-verify "0 9.9.9 proto 1" "1.2.3" 1))
+  (should-not (scrutiny-agent--parse-verify "0 1.2.3 proto 1" "1.2.3" 1))
+  (let ((reason (scrutiny-agent--parse-verify "0 1.2.3 proto 2" "1.2.3" 1)))
+    (should (string-match-p "speaks protocol 2" reason))
+    (should (string-match-p "client speaks protocol 1" reason)))
+  ;; Not our program at all.
+  (let ((reason (scrutiny-agent--parse-verify "0 some other tool 1.0"
+                                              "1.2.3" 1)))
+    (should (string-match-p "protocol 1" reason))
+    (should (string-match-p "some other tool" reason)))
+  ;; Exec failures read the same either way.
+  (should (string-match-p "architecture"
+                          (scrutiny-agent--parse-verify
+                           "126 sh: /x: Exec format error" "1.2.3" 1)))
+  (should (string-match-p "exited 1"
+                          (scrutiny-agent--parse-verify "1 " "1.2.3" 1))))
+
+(ert-deftest scrutiny-agent-remote-binary-is-a-shell-expression ()
+  (should-not (scrutiny-agent--remote-binary '(:transport "sh")))
+  (should (equal (scrutiny-agent--remote-binary
+                  '(:remote-binary "$HOME/bin/scrutiny-agent"))
+                 "$HOME/bin/scrutiny-agent"))
+  ;; Inside the double quotes the remote shell uses, ~ is a literal.
+  (should (equal (scrutiny-agent--remote-binary
+                  '(:remote-binary "~/src/scrutiny-agent/build/agent/scrutiny-agent"))
+                 "$HOME/src/scrutiny-agent/build/agent/scrutiny-agent"))
+  (should-error (scrutiny-agent--remote-binary '(:remote-binary (a b)))))
+
+(defun scrutiny-agent-tests--connect-remote-binary (remote)
+  "Connect a host whose agent is REMOTE, a path on the (local) host.
+Returns (REASON . SENT): REASON is nil on success or the error text,
+SENT the list of strings written to the transport before the error
+or the exec."
+  (let* ((install (make-temp-file "scra-rb-install" t))
+         (sent nil)
+         (scrutiny-agent-default-config nil)
+         (scrutiny-agent-hosts
+          `(("rb" :transport "sh" :install-dir ,install
+             :remote-binary ,remote))))
+    (unwind-protect
+        (cl-letf* ((original (symbol-function 'process-send-string))
+                   ((symbol-function 'process-send-string)
+                    (lambda (proc text)
+                      (unless (scrutiny-agent-connection "rb")
+                        (push text sent))
+                      (funcall original proc text)))
+                   ;; Nothing on this side may be consulted.
+                   ((symbol-function 'scrutiny-agent--local-binary)
+                    (lambda (&rest _)
+                      (error "local binary lookup must not run"))))
+          (cons (condition-case err
+                    (progn (scrutiny-agent-connect "rb") nil)
+                  (error (error-message-string err)))
+                (progn
+                  (should-not (directory-files install nil "scrutiny-agent-"))
+                  (nreverse sent))))
+      (ignore-errors (scrutiny-agent-disconnect "rb"))
+      (delete-directory install t))))
+
+(ert-deftest scrutiny-agent-remote-binary-runs-what-is-on-the-host ()
+  :tags '(integration)
+  (skip-unless (getenv "SCRUTINY_AGENT_BIN"))
+  (let* ((result (scrutiny-agent-tests--connect-remote-binary
+                  (expand-file-name (getenv "SCRUTINY_AGENT_BIN"))))
+         (sent (string-join (cdr result) "")))
+    ;; No error means the handshake completed against that binary.
+    (should-not (car result))
+    ;; Probe, verify, exec: no hash gate, no stream, no install.
+    (should (string-search "__SCRA_PROBE__" sent))
+    (should (string-search "__SCRA_VERIFY__" sent))
+    (should-not (string-search "__SCRA_ST__" sent))
+    (should-not (string-search "__SCRB64__" sent))
+    (should-not (string-search "__SCRA_INST__" sent))
+    (should (string-search (concat "exec \"" (expand-file-name
+                                               (getenv "SCRUTINY_AGENT_BIN"))
+                                   "\" --rpc-stdio")
+                           sent))))
+
+(ert-deftest scrutiny-agent-remote-binary-must-exist-on-the-host ()
+  :tags '(integration)
+  (skip-unless (getenv "SCRUTINY_AGENT_BIN"))
+  (let ((reason (car (scrutiny-agent-tests--connect-remote-binary
+                      "/nonexistent/scrutiny-agent"))))
+    (should reason)
+    (should (string-match-p "does not run on" reason))
+    (should (string-search ":remote-binary" reason))
+    (should (string-search "/nonexistent/scrutiny-agent" reason))))
+
+(ert-deftest scrutiny-agent-remote-binary-must-speak-our-protocol ()
+  :tags '(integration)
+  (skip-unless (getenv "SCRUTINY_AGENT_BIN"))
+  ;; The version is the user's business; the protocol is not.
+  (let ((old (make-temp-file "scra-rb-proto"))
+        (other (make-temp-file "scra-rb-ver")))
+    (unwind-protect
+        (progn
+          (with-temp-file old
+            (insert "#!/bin/sh\necho \"0.1.0 proto "
+                    (number-to-string (1+ scrutiny-agent-protocol-version))
+                    "\"\n"))
+          (set-file-modes old #o755)
+          (let ((reason (car (scrutiny-agent-tests--connect-remote-binary old))))
+            (should reason)
+            (should (string-match-p
+                     (format "speaks protocol %d, but this client speaks \
+protocol %d"
+                             (1+ scrutiny-agent-protocol-version)
+                             scrutiny-agent-protocol-version)
+                     reason))
+            (should (string-search old reason)))
+          ;; Right protocol, some other version: accepted at verify.
+          ;; (It is a shell script, so the handshake then fails; the
+          ;; failure must be past the verify step.)
+          (with-temp-file other
+            (insert "#!/bin/sh\n[ \"$1\" = --version ] && echo \"9.9.9 proto "
+                    (number-to-string scrutiny-agent-protocol-version)
+                    "\"\n"))
+          (set-file-modes other #o755)
+          (let ((reason (car (scrutiny-agent-tests--connect-remote-binary
+                              other))))
+            (should reason)
+            (should-not (string-match-p "does not run on" reason))))
+      (delete-file old)
+      (delete-file other))))
 
 (defun scrutiny-agent-tests--connect-with-binary (binary &optional unchecked)
   "Connect a host using BINARY; return nil on success or the error text.
@@ -965,6 +1104,23 @@ differ from what the header promised."
             (should reason)
             (should (string-match-p "expected version" reason))))
       (delete-file file))))
+
+(ert-deftest scrutiny-agent-eglot-setup-defers-until-eglot-loads ()
+  ;; Calling the setup from init must not load eglot (and with it xref,
+  ;; project, flymake...); the contacts go on once eglot arrives, and
+  ;; the hook that waited for it is gone afterwards.  Written without
+  ;; `with-eval-after-load', which package-lint refuses in a package.
+  (skip-unless (not (featurep 'eglot)))
+  (scrutiny-agent-eglot-setup)
+  (should-not (featurep 'eglot))
+  (should (memq #'scrutiny-agent-eglot--register-when-loaded
+                after-load-functions))
+  (require 'eglot)
+  (should scrutiny-agent-eglot--entries)
+  (should-not (memq #'scrutiny-agent-eglot--register-when-loaded
+                    after-load-functions))
+  (should (cl-every (lambda (e) (memq e eglot-server-programs))
+                    scrutiny-agent-eglot--entries)))
 
 (ert-deftest scrutiny-agent-unsupported-platform-is-named ()
   ;; "we publish nothing for this" and "the binary is broken" are

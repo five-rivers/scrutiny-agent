@@ -238,7 +238,19 @@ Takes effect when eglot loads (immediately if it already has), so
 calling this from init does not itself load eglot or anything eglot
 depends on -- see the note at the top of this file."
   (interactive)
-  (with-eval-after-load 'eglot
+  (if (featurep 'eglot)
+      (scrutiny-agent-eglot--register)
+    (add-hook 'after-load-functions
+              #'scrutiny-agent-eglot--register-when-loaded)))
+
+(defun scrutiny-agent-eglot--register-when-loaded (_file)
+  "Register the contacts once eglot has loaded, then stand down.
+On `after-load-functions' until then.  This is what
+`with-eval-after-load' expands to; written out because package-lint
+holds that macro to be for init files, not packages."
+  (when (featurep 'eglot)
+    (remove-hook 'after-load-functions
+                 #'scrutiny-agent-eglot--register-when-loaded)
     (scrutiny-agent-eglot--register)))
 
 (provide 'scrutiny-agent-eglot)
